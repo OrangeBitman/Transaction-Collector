@@ -1,1 +1,4 @@
 /.idea/
+/.venv/
+/Transaction-Collector.iml
+/transaction_collector.log
