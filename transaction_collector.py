@@ -11,6 +11,7 @@ import datetime as dt
 import decimal
 import hashlib
 import json
+import re
 import ssl
 import struct
 import sys
@@ -18,6 +19,7 @@ import time
 import csv
 import random
 import urllib.request, urllib.error
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -737,9 +739,9 @@ def build_rows_for_csv(
 
 def main():
     """Einstiegspunkt: Parst Kommandozeilenargumente, baut den Mempool-Client auf,
-    lädt die Transaktion, berechnet Gebühren und schreibt die Ergebnis-CSV."""
-    parser = argparse.ArgumentParser(description="BTC Mittelherkunftsnachweis aus mempool.space")
-    parser.add_argument("transaction_id", help="Zu untersuchende Transaktions-ID (txid)")
+    verarbeitet alle TX-IDs aus der Eingabedatei und schreibt je eine Ergebnis-CSV."""
+    parser = argparse.ArgumentParser(description="BTC Mittelherkunftsnachweis aus mempool.space (Batch)")
+    parser.add_argument("txlist", help="Pfad zur Textdatei mit TX-IDs (eine pro Zeile)")
 
     # mempool.space
     parser.add_argument("--mempool-base", default="https://mempool.space/api", help="Basis-URL der mempool.space API")
@@ -748,7 +750,22 @@ def main():
     parser.add_argument("--timeout", type=float, default=20.0, help="Socket-Timeout je Lesevorgang (Sek.)")
 
     # Ausgabe/Optionen
-    parser.add_argument("--csv-out", default="nachweis.csv", help="Pfad zur Ausgabedatei (CSV)")
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--digits", type=int,
+                   help="Anzahl Stellen für führende Nullen im Dateinamen (z.B. 3 → 001_…)")
+    g.add_argument("--auto-digits", action="store_true",
+                   help="Stellenzahl automatisch anhand der Anzahl gültiger TX-IDs bestimmen")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Vorhandene CSV-Dateien überschreiben")
+    parser.add_argument(
+        "--output-mode",
+        default="split",
+        choices=["split", "combined"],
+        help=(
+            "Ausgabemodus: 'split' (Standard) erstellt je TX-ID eine eigene CSV; "
+            "'combined' schreibt alle TX-IDs in eine gemeinsame CSV (resources/combined.csv)"
+        ),
+    )
     parser.add_argument(
         "--decimal-sep",
         default=",",
@@ -762,39 +779,127 @@ def main():
 
     setup_logging(debug=args.debug, log_file=args.log_file if args.log_file.strip() else None)
 
+    # Eingabedatei prüfen
+    txfile = Path(args.txlist)
+    if not txfile.exists():
+        logger.error(f"Datei nicht gefunden: {txfile}")
+        sys.exit(1)
+
+    # TX-IDs einlesen, validieren und de-duplizieren
+    TXID_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+    def iter_txids(path: Path):
+        seen = set()
+        with path.open("r", encoding="utf-8") as f:
+            for lineno, raw in enumerate(f, 1):
+                txid = raw.strip()
+                if not txid or txid.startswith("#"):
+                    continue
+                if not TXID_RE.fullmatch(txid):
+                    logger.warning(f"Zeile {lineno}: Ungültige TX-ID übersprungen: {txid}")
+                    continue
+                if txid in seen:
+                    logger.info(f"Zeile {lineno}: Duplikat übersprungen: {txid}")
+                    continue
+                seen.add(txid)
+                yield txid
+
+    txids = list(iter_txids(txfile))
+    if not txids:
+        logger.info("Keine gültigen TX-IDs gefunden. Nichts zu tun.")
+        return
+
+    # Breite für führende Nullen bestimmen
+    if args.digits is not None:
+        if args.digits <= 0:
+            logger.error("--digits muss > 0 sein.")
+            sys.exit(1)
+        width = args.digits
+    elif args.auto_digits:
+        width = max(1, len(str(len(txids))))
+    else:
+        width = 0  # keine führenden Nullen
+
+    # Ausgabeverzeichnis sicherstellen
+    out_dir = Path("resources")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Client einmalig aufbauen
     cafile = args.cafile if args.cafile.strip() else None
-    client: Any = MempoolClient(base_url=args.mempool_base, timeout=args.timeout, retries=1, cafile=cafile, insecure=args.insecure)
+    client: Any = MempoolClient(
+        base_url=args.mempool_base,
+        timeout=args.timeout,
+        retries=1,
+        cafile=cafile,
+        insecure=args.insecure,
+    )
     if args.debug:
         src = cafile or (f"certifi ({DEFAULT_CAFILE})" if DEFAULT_CAFILE else "System-Store")
         insecure_note = " (INSECURE)" if args.insecure else ""
         logger.debug(f"Verwende mempool.space REST-API: {args.mempool_base} | CA: {src}{insecure_note}")
 
-    try:
-        tx, bh, bhash, btime, fee_sats = fetch_tx_full(client, args.transaction_id, debug=args.debug)
-        fee_sats = compute_fee_if_needed(client, tx, fee_sats, debug=args.debug)
+    any_errors = False
+    all_rows: List[Dict[str, Any]] = []  # wird nur im combined-Modus befüllt
 
-        rows, ins_sum, outs_sum = build_rows_for_csv(
-            client, args.transaction_id, tx, bh, bhash, btime, fee_sats,
-            debug=args.debug, decimal_sep=args.decimal_sep
-        )
+    for idx, txid in enumerate(txids, start=1):
+        idx_str = str(idx).zfill(width) if width else str(idx)
+        # TX-ID im Dateinamen auf 16 Zeichen kürzen
+        out_csv = out_dir / f"{idx_str}_{txid[:16]}.csv"
 
-        write_csv(args.csv_out, rows)
-        logger.info(f"CSV geschrieben: {args.csv_out}")
+        if args.output_mode == "split" and out_csv.exists() and not args.overwrite:
+            logger.info(f"Überspringe {txid} (Ausgabe existiert bereits: {out_csv})")
+            continue
 
-        if args.debug and not bh:
-            logger.debug("Hinweis: Keine Blockhöhe gefunden (TX unbestätigt oder nicht in History auffindbar).")
+        logger.info(f"[{idx}/{len(txids)}] Verarbeite TX: {txid}")
+        try:
+            tx, bh, bhash, btime, fee_sats = fetch_tx_full(client, txid, debug=args.debug)
+            fee_sats = compute_fee_if_needed(client, tx, fee_sats, debug=args.debug)
 
-    except KeyboardInterrupt:
-        logger.error("\nVom Benutzer abgebrochen.")
-        sys.exit(130)
-    except ElectrumXConnectionError as e:
-        logger.error(f"Verbindungsfehler: {e}")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Unerwarteter Fehler: {e}")
-        if args.debug:
-            raise
-        sys.exit(1)
+            rows, ins_sum, outs_sum = build_rows_for_csv(
+                client, txid, tx, bh, bhash, btime, fee_sats,
+                debug=args.debug, decimal_sep=args.decimal_sep,
+            )
+
+            if args.output_mode == "split":
+                write_csv(str(out_csv), rows)
+                logger.info(f"CSV geschrieben: {out_csv}")
+            else:
+                all_rows.extend(rows)
+                logger.info(f"TX {txid} gesammelt ({len(rows)} Zeilen)")
+
+            if args.debug and not bh:
+                logger.debug("Hinweis: Keine Blockhöhe gefunden (TX unbestätigt oder nicht in History auffindbar).")
+
+        except KeyboardInterrupt:
+            logger.error("\nVom Benutzer abgebrochen.")
+            sys.exit(130)
+        except ElectrumXConnectionError as e:
+            any_errors = True
+            logger.error(f"Verbindungsfehler bei TX {txid}: {e}")
+        except Exception as e:
+            any_errors = True
+            logger.error(f"Unerwarteter Fehler bei TX {txid}: {e}")
+            if args.debug:
+                raise
+
+    # combined-Modus: eine gemeinsame CSV am Ende schreiben
+    if args.output_mode == "combined":
+        combined_csv = out_dir / "combined.csv"
+        if combined_csv.exists() and not args.overwrite:
+            logger.error(
+                f"Ausgabedatei existiert bereits: {combined_csv}. "
+                "Verwende --overwrite zum Überschreiben."
+            )
+            sys.exit(1)
+        if all_rows:
+            write_csv(str(combined_csv), all_rows)
+            logger.info(f"Kombinierte CSV geschrieben: {combined_csv} ({len(all_rows)} Zeilen gesamt)")
+        else:
+            logger.info("Keine Zeilen zum Schreiben (alle TX-IDs fehlgeschlagen oder übersprungen).")
+
+    if any_errors:
+        sys.exit(2)
+
 
 if __name__ == "__main__":
     main()
