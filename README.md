@@ -171,6 +171,7 @@ Die CSV-Datei enthält **eine Zeile pro Input oder Output** der Transaktion. Die
 | `2`  | Mindestens eine TX-ID konnte nicht verarbeitet werden        |
 | `130`| Abbruch durch den Benutzer (Strg+C)                          |
 
+
 ---
 
 ## Lizenz
