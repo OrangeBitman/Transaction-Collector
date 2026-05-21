@@ -84,9 +84,13 @@ Leerzeilen und Zeilen, die mit `#` beginnen, werden ignoriert.
 Doppelte TX-IDs werden automatisch übersprungen.
 
 ### Beispiel einer Eingabedatei
-\# transaction_id\
-a1ef55cc86c0596b55ca92360715a57071cb3d598571013b51121eed4d2642c7
-4d9887ac983f0487176ed76a5e2d8780bd7b89554f2b813f66b48f0093cacc40
+
+| transaction_id                                                       |
+|----------------------------------------------------------------------|
+| `a1ef55cc86c0596b55ca92360715a57071cb3d598571013b51121eed4d2642c7`   |
+| `4d9887ac983f0487176ed76a5e2d8780bd7b89554f2b813f66b48f0093cacc40`   |
+| `adf2355ff1e0fb26b86bf2abd8438662e116c11d0257c76f7602c56cf43b4e57`   |
+
 ---
 
 ## Ausgabedateien
